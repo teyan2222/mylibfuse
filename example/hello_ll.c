@@ -29,7 +29,10 @@
 #include <unistd.h>
 #include <assert.h>
 
-static const char *hello_str = "Hello World!\n";
+//static const char *hello_str = "Hello World!\n";
+static char *file_buffer;
+static const size_t file_len = 40*1024;
+static const size_t times = 100;
 static const char *hello_name = "hello";
 
 static int hello_stat(fuse_ino_t ino, struct stat *stbuf)
@@ -42,9 +45,10 @@ static int hello_stat(fuse_ino_t ino, struct stat *stbuf)
 		break;
 
 	case 2:
-		stbuf->st_mode = S_IFREG | 0444;
+		stbuf->st_mode = S_IFREG | 0777;
 		stbuf->st_nlink = 1;
-		stbuf->st_size = strlen(hello_str);
+                //stbuf->st_size = strlen(hello_str);
+		stbuf->st_size = file_len * times;
 		break;
 
 	default:
@@ -138,8 +142,8 @@ static void hello_ll_open(fuse_req_t req, fuse_ino_t ino,
 {
 	if (ino != 2)
 		fuse_reply_err(req, EISDIR);
-	else if ((fi->flags & O_ACCMODE) != O_RDONLY)
-		fuse_reply_err(req, EACCES);
+//	else if ((fi->flags & O_ACCMODE) != O_RDONLY)
+//		fuse_reply_err(req, EACCES);
 	else
 		fuse_reply_open(req, fi);
 }
@@ -149,8 +153,32 @@ static void hello_ll_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 {
 	(void) fi;
 
+	size_t off_in_buf = off % file_len;
 	assert(ino == 2);
-	reply_buf_limited(req, hello_str, strlen(hello_str), off, size);
+	reply_buf_limited(req, file_buffer, file_len, off_in_buf, size);
+	//reply_buf_limited(req, hello_str, strlen(hello_str), off, size);
+}
+
+static void hello_ll_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
+		           size_t size, off_t off, struct fuse_file_info *fi)
+{
+//	printf("Size: %ld, Offset %ld\n", size, off);
+	(void)fi;
+	size_t off_in_buf = off % file_len;
+	assert(ino == 2);
+	if(off_in_buf + size < file_len)
+	{
+		memcpy(file_buffer + off_in_buf, buf, size);
+	}
+	else
+	{
+		size_t size1 = file_len - off_in_buf;
+		size_t size2 = size - size1;
+		memcpy(file_buffer + off_in_buf, buf, size1);
+		memcpy(file_buffer, buf + size1, size2);
+	}
+	fuse_reply_write(req, size);
+
 }
 
 static const struct fuse_lowlevel_ops hello_ll_oper = {
@@ -159,6 +187,7 @@ static const struct fuse_lowlevel_ops hello_ll_oper = {
 	.readdir	= hello_ll_readdir,
 	.open		= hello_ll_open,
 	.read		= hello_ll_read,
+	.write          = hello_ll_write,
 };
 
 int main(int argc, char *argv[])
@@ -167,6 +196,11 @@ int main(int argc, char *argv[])
 	struct fuse_session *se;
 	struct fuse_cmdline_opts opts;
 	struct fuse_loop_config config;
+	file_buffer = (char*)malloc(file_len);
+	for(size_t i = 0;i<file_len;i++)
+	{
+		file_buffer[i] = 'a' + i % 26;
+	}
 	int ret = -1;
 
 	if (fuse_parse_cmdline(&args, &opts) != 0)
