@@ -2,7 +2,8 @@ examples = [ 'passthrough', 'passthrough_fh',
              'hello', 'hello_ll', 'printcap',
              'ioctl_client', 'poll_client', 'ioctl',
              'cuse', 'cuse_client' ]
-
+cpp = meson.get_compiler('cpp')
+rpma = cpp.find_library('rpma')
 if not platform.endswith('bsd') and platform != 'dragonfly'
     examples += 'passthrough_ll'
 
@@ -20,7 +21,7 @@ threaded_examples = [ 'notify_inval_inode',
 
 foreach ex : examples
     executable(ex, ex + '.c',
-               dependencies: [ libfuse_dep ],
+               dependencies: [ libfuse_dep, rpma ],
                install: false)
 endforeach
 
