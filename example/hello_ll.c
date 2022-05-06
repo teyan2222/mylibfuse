@@ -63,7 +63,10 @@ client_connect(struct rpma_peer *peer, const char *addr, const char *port,
 	/* create a connection request */
 	int ret = rpma_conn_req_new(peer, addr, port, cfg, &req);
 	if (ret)
+    {
+        printf("rpma_conn_req_new error\n");
 		return ret;
+    }
 
 	/* connect the connection request and obtain the connection object */
 	ret = rpma_conn_req_connect(&req, pdata, conn_ptr);
@@ -118,19 +121,35 @@ int init_rpma(struct rpma_context *ctx, const char *addr)
 //    int ret = client_peer_via_address(addr, &ctx->peer);
     const char *port = "19007";
     struct ibv_context *ibv_ctx = NULL;
+    ctx->time_us0 = 0;
+    ctx->time_us1 = 0;
+    ctx->time_us2 = 0;
+    ctx->time_us3 = 0;
+    ctx->rd_count = 0;
+    ctx->time_usa = 0;
+    ctx->time_usb = 0;
+    ctx->time_usc = 0;
+    ctx->time_usd = 0;
+    ctx->time_use = 0;
+    ctx->time_usf = 0;
+    ctx->wr_count = 0;
     int ret = rpma_utils_get_ibv_context(addr, RPMA_UTIL_IBV_CONTEXT_REMOTE, &ibv_ctx);
     if(ret) return ret;
     ret = rpma_peer_new(ibv_ctx, &ctx->peer);
     if(ret) return ret;
-    ctx->dst_ptr = malloc_aligned(KILOBYTE);
-    if(ctx->dst_ptr == NULL)
+    ctx->rd_dst_ptr = malloc_aligned(BUFFER_SIZE);
+    ctx->wr_src_ptr = malloc_aligned(BUFFER_SIZE);
+    if(ctx->rd_dst_ptr == NULL || ctx->wr_src_ptr == NULL)
     {
         ret = -1;
         goto err_peer_delete;
     }
     if(ret) goto err_mr_free;
 
-    ret = rpma_mr_reg(ctx->peer, ctx->dst_ptr, KILOBYTE, RPMA_MR_USAGE_READ_DST, &ctx->dst_mr);
+    ret = rpma_mr_reg(ctx->peer, ctx->rd_dst_ptr, BUFFER_SIZE, RPMA_MR_USAGE_READ_DST, &ctx->rd_local_mr);
+    if(ret) goto err_mr_free;
+
+    ret = rpma_mr_reg(ctx->peer, ctx->wr_src_ptr, BUFFER_SIZE, RPMA_MR_USAGE_WRITE_SRC, &ctx->wr_local_mr);
     if(ret) goto err_mr_free;
 
     ret = client_connect(ctx->peer, addr, port, NULL, NULL, &ctx->conn);
@@ -147,12 +166,23 @@ int init_rpma(struct rpma_context *ctx, const char *addr)
         printf(" the server has not provide a remote mem region.\n");
         goto err_conn_disconnect;
     }
-    ret = rpma_mr_remote_get_size(ctx->src_mr, &ctx->src_size);
+    struct common_data *dst_data = pdata.ptr;
+    ret = rpma_mr_remote_from_descriptor(&dst_data->descriptors[0],
+            dst_data->mr_desc_size, &ctx->remote_mr);
     if(ret)
     {
+        printf("rpma_mr_remote_from_descriptor error\n");
+        goto err_conn_disconnect;
+    }
+
+
+    ret = rpma_mr_remote_get_size(ctx->remote_mr, &ctx->remote_size);
+    if(ret)
+    {
+        printf("rpma_mr_remote_get_size error \n");
         goto err_mr_remote_delete;
     }
-    else if (ctx->src_size > KILOBYTE)
+    else if (ctx->remote_size > BUFFER_SIZE)
     {
         printf("too big\n");
         goto err_mr_remote_delete;
@@ -161,23 +191,26 @@ int init_rpma(struct rpma_context *ctx, const char *addr)
     return 0;
 
 err_mr_remote_delete:
-    rpma_mr_remote_delete(&ctx->src_mr);
+    rpma_mr_remote_delete(&ctx->remote_mr);
 err_conn_disconnect:
     common_disconnect_and_wait_for_conn_close(&ctx->conn);
 err_mr_deret:
-    rpma_mr_dereg(&ctx->dst_mr);
+    rpma_mr_dereg(&ctx->rd_local_mr);
+    rpma_mr_dereg(&ctx->wr_local_mr);
 err_mr_free:
-    free(&ctx->dst_ptr);
+    free(&ctx->rd_dst_ptr);
+    free(&ctx->wr_src_ptr);
 err_peer_delete:
     rpma_peer_delete(&ctx->peer);
     return ret;
 }
 
 //static const char *hello_str = "Hello World!\n";
-static char *file_buffer;
-static const size_t file_len = 64*1024;
-static const size_t times = 16384;
+//static char *file_buffer;
+//static const size_t file_len = 64*1024;
+static const size_t times = 1;
 static const char *hello_name = "hello";
+struct rpma_context *rpmactx;
 
 static int hello_stat(fuse_ino_t ino, struct stat *stbuf)
 {
@@ -192,7 +225,8 @@ static int hello_stat(fuse_ino_t ino, struct stat *stbuf)
         stbuf->st_mode = S_IFREG | 0777;
         stbuf->st_nlink = 1;
                 //stbuf->st_size = strlen(hello_str);
-        stbuf->st_size = file_len * times;
+       // stbuf->st_size = file_len * times;
+        stbuf->st_size = rpmactx->remote_size* times;
         break;
 
     default:
@@ -292,14 +326,52 @@ static void hello_ll_open(fuse_req_t req, fuse_ino_t ino,
         fuse_reply_open(req, fi);
 }
 
+int timespan_us(struct timespec *from, struct timespec *to)
+{
+    size_t result = 0;
+    if(to->tv_nsec < from->tv_nsec)
+    {
+        result = (to->tv_sec - from->tv_sec -1) * 1000000000;
+        result += 1000000000 + to->tv_nsec - from->tv_nsec;
+    }
+    else
+    {
+        result = (to->tv_sec - from->tv_sec) * 1000000000;
+        result += to->tv_nsec - from->tv_nsec;
+
+    }
+    return result; 
+}
+
 static void hello_ll_read(fuse_req_t req, fuse_ino_t ino, size_t size,
               off_t off, struct fuse_file_info *fi)
 {
     (void) fi;
+    struct timespec time0, time1, time2, time3, time4;
 
-    size_t off_in_buf = off % file_len;
+    size_t off_in_buf = off % rpmactx->remote_size;
     assert(ino == 2);
-    reply_buf_limited(req, file_buffer, file_len, off_in_buf, size);
+    int ret = 0;
+    clock_gettime(CLOCK_MONOTONIC, &time0);
+    ret = rpma_read(rpmactx->conn, rpmactx->rd_local_mr, off_in_buf, rpmactx->remote_mr, off_in_buf, size,
+            RPMA_F_COMPLETION_ALWAYS, NULL);
+    struct rpma_cq *cq = NULL;
+    clock_gettime(CLOCK_MONOTONIC, &time1);
+    ret = rpma_conn_get_cq(rpmactx->conn, &cq);
+   // printf("Ret %d\n",ret);
+    clock_gettime(CLOCK_MONOTONIC, &time2);
+    ret = rpma_cq_wait(cq);
+    clock_gettime(CLOCK_MONOTONIC, &time3);
+    ret = rpma_cq_get_wc(cq, 1, &rpmactx->wc, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &time4);
+    if(ret) {printf("Error");}
+    reply_buf_limited(req, rpmactx->rd_dst_ptr, rpmactx->remote_size, off_in_buf, size);
+    rpmactx->time_us0 += timespan_us(&time0, &time1);
+    rpmactx->time_us1 += timespan_us(&time1, &time2);
+    rpmactx->time_us2 += timespan_us(&time2, &time3);
+    rpmactx->time_us3 += timespan_us(&time3, &time4);
+    rpmactx->rd_count +=1000;
+    //printf("Time: %ld, %ld, %ld, %ld\n", rpmactx->time_us0, rpmactx->time_us1, rpmactx->time_us2, rpmactx->time_us3);
     //reply_buf_limited(req, hello_str, strlen(hello_str), off, size);
 }
 
@@ -308,34 +380,83 @@ static void hello_ll_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
 {
 //    printf("Size: %ld, Offset %ld\n", size, off);
     (void)fi;
-    size_t off_in_buf = off % file_len;
+    struct timespec time0, time1, time2, time3, time4, time5, time6;
+    size_t off_in_buf = off % rpmactx->remote_size;
     assert(ino == 2);
-    if(off_in_buf + size < file_len)
+    clock_gettime(CLOCK_MONOTONIC, &time0);
+    memcpy(rpmactx->wr_src_ptr + off_in_buf, buf, size);
+    int ret = 0;
+    clock_gettime(CLOCK_MONOTONIC, &time1);
+    ret = rpma_write(rpmactx->conn, rpmactx->remote_mr, off_in_buf, rpmactx->wr_local_mr, off_in_buf,
+            size, RPMA_F_COMPLETION_ON_ERROR, NULL);
+    if(ret) {printf("Error");}
+    clock_gettime(CLOCK_MONOTONIC, &time2);
+    ret = rpma_read(rpmactx->conn, rpmactx->rd_local_mr, off_in_buf, rpmactx->remote_mr, off_in_buf, 8, RPMA_F_COMPLETION_ALWAYS, NULL);
+    if(ret) {printf("Error");}
+
+    clock_gettime(CLOCK_MONOTONIC, &time3);
+    struct rpma_cq *cq=NULL;
+    ret = rpma_conn_get_cq(rpmactx->conn, &cq);
+    if(ret) {printf("Error");}
+    clock_gettime(CLOCK_MONOTONIC, &time4);
+    ret = rpma_cq_wait(cq);
+    if(ret) {printf("Error");}
+
+    clock_gettime(CLOCK_MONOTONIC, &time5);
+    ret = rpma_cq_get_wc(cq, 1, &rpmactx->wc, NULL);
+    if(ret) {printf("Error");}
+    clock_gettime(CLOCK_MONOTONIC, &time6);
+    /*
+    if(off_in_buf + size < rpmactx->src_size)
     {
         memcpy(file_buffer + off_in_buf, buf, size);
     }
     else
     {
-        size_t size1 = file_len - off_in_buf;
+        size_t size1 = rpmactx->src_size - off_in_buf;
         size_t size2 = size - size1;
         memcpy(file_buffer + off_in_buf, buf, size1);
         memcpy(file_buffer, buf + size1, size2);
     }
+    */
     fuse_reply_write(req, size);
+    rpmactx->time_usa += timespan_us(&time0, &time1);
+    rpmactx->time_usb += timespan_us(&time1, &time2);
+    rpmactx->time_usc += timespan_us(&time2, &time3);
+    rpmactx->time_usd += timespan_us(&time3, &time4);
+    rpmactx->time_use += timespan_us(&time4, &time5);
+    rpmactx->time_usf += timespan_us(&time5, &time6);
+    rpmactx->wr_count +=1000;
 
 }
 
 static void hello_ll_init(void *userdata, struct fuse_conn_info *conn)
 {
-    (void)(userdata);
+    struct rpma_context *ctx = (struct rpma_context*)userdata;
     (void)(conn);
     printf("Hello Init\n");
+    init_rpma(ctx, "100.84.21.13");
+    printf("Filesize: %ld\n", ctx->remote_size);
 }
 
 static void hello_ll_destroy(void *userdata)
 {
-    (void)(userdata);
+    struct rpma_context *ctx = (struct rpma_context*)userdata;
     printf("Hello destroy\n");
+    printf("===== Read =====\n");
+    printf("Count %ld\n", ctx->rd_count / 1000);
+    printf("rpma_read %.3f\n", (double)ctx->time_us0 / ctx->rd_count );
+    printf("rpma_conn_get_cq %.3f\n", (double)ctx->time_us1 / ctx->rd_count );
+    printf("rpma_cq_wait %.3f\n", (double)ctx->time_us2 / ctx->rd_count );
+    printf("rpma_cq_get_wc %.3f\n", (double)ctx->time_us3 / ctx->rd_count );
+    printf("===== Write =====\n");
+    printf("Count %ld\n", ctx->wr_count / 1000);
+    printf("memcpy %.3f\n", (double)ctx->time_usa / ctx->wr_count );
+    printf("rpma_write %.3f\n", (double)ctx->time_usb / ctx->wr_count );
+    printf("rpma_read %.3f\n", (double)ctx->time_usc / ctx->wr_count );
+    printf("rpma_conn_get_cq %.3f\n", (double)ctx->time_usd / ctx->wr_count );
+    printf("rpma_cq_wait %.3f\n", (double)ctx->time_use / ctx->wr_count );
+    printf("rpma_cq_get_wc %.3f\n", (double)ctx->time_usf / ctx->wr_count );
 }
 
 static const struct fuse_lowlevel_ops hello_ll_oper = {
@@ -355,11 +476,13 @@ int main(int argc, char *argv[])
     struct fuse_session *se;
     struct fuse_cmdline_opts opts;
     struct fuse_loop_config config;
-    file_buffer = (char*)malloc(file_len);
-    for(size_t i = 0;i<file_len;i++)
-    {
-        file_buffer[i] = 'a' + i % 26;
-    }
+    //struct rpma_context rpmactx;
+    //file_buffer = (char*)malloc(file_len);
+    rpmactx = (struct rpma_context*)malloc(sizeof(struct rpma_context));
+    //for(size_t i = 0;i<file_len;i++)
+    //{
+    //    file_buffer[i] = 'a' + i % 26;
+    //}
     int ret = -1;
 
     if (fuse_parse_cmdline(&args, &opts) != 0)
@@ -385,7 +508,7 @@ int main(int argc, char *argv[])
     }
 
     se = fuse_session_new(&args, &hello_ll_oper,
-                  sizeof(hello_ll_oper), NULL);
+                  sizeof(hello_ll_oper), rpmactx);
     if (se == NULL)
         goto err_out1;
 
